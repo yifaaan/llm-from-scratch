@@ -1,0 +1,35 @@
+[33mcommit 2e7cb920735dffd5ab052965f312311f183a0d53[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m)[m
+Author: yifaaan <0219lyf@gmail.com>
+Date:   Sun Jun 22 09:34:59 2025 +0800
+
+    read tensor weights
+
+[33mcommit 48d57e1ad0ba9c977a137bd10eb79fc031d76699[m
+Author: yifaaan <0219lyf@gmail.com>
+Date:   Sat Jun 21 19:14:04 2025 +0800
+
+    finish train
+
+[33mcommit 2e8d4971bb5527bfac30c539a5edc35f8debe3c5[m
+Author: yifaaan <0219lyf@gmail.com>
+Date:   Thu Jun 19 23:34:27 2025 +0800
+
+    gpt, todo: generate text
+
+[33mcommit 4c1db60b0467cb893530b61fb94fde3a0bbc0e95[m
+Author: yifaaan <0219lyf@gmail.com>
+Date:   Wed Jun 18 23:35:14 2025 +0800
+
+    gpt arch
+
+[33mcommit db5d2ab4cc686cdc33a67f92350d0775f4a7bd02[m
+Author: yifaaan <0219lyf@gmail.com>
+Date:   Wed Jun 18 15:59:13 2025 +0800
+
+    finish attention head
+
+[33mcommit e2ea4b6e9f8e8abfb868c9713c20cc21107260a0[m
+Author: yifaaan <0219lyf@gmail.com>
+Date:   Tue Jun 17 21:25:35 2025 +0800
+
+    finish dataset and embedding, we can get the GPT input datas

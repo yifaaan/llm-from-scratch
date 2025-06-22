@@ -1,0 +1,9 @@
+{
+  "name": "gpt2",
+  "version": "1.0.0",
+  "description": "A simple GPT2",
+  "dependencies": [
+    "fmt",
+    "nlohmann-json"
+  ]
+} 

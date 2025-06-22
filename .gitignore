@@ -1,0 +1,8 @@
+model.safetensors
+data
+enc
+compile_commands.json
+gpt2-Linux
+build
+.venv
+.cache
