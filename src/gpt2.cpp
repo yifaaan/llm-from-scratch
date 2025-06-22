@@ -18,6 +18,8 @@ template <typename T> constexpr size_t AlignedSize() {
 constexpr auto VocabSize = 50257;
 constexpr auto DModel = 768;
 constexpr auto DSeq = 1024;
+constexpr auto DK = DModel / 12;
+constexpr auto EPS = 1e-5f;
 
 // constexpr auto VocabLength = 321428;
 constexpr auto VocabLength = 320827;
@@ -62,17 +64,35 @@ struct Parameters {
 };
 
 struct Activation {
-  struct Embedding {
-    float out[DSeq][DModel];
-  };
-  
-  struct LayerNorm {
-    float out[DSeq][DModel];
+  // Token embedding + position embedding
+  float embedding_out[DSeq][DModel];
+
+  struct TransformerBlock {
+    // LayerNorm 1
+    float ln_1_out[DSeq][DModel];
+    // Self-Attention: Q, K, V
+    //  每个头的维度 | d_k = 64 (隐式) | head_dim = 64 (需要定义) | 64 | DModel
+    //  num_heads，即 768 / 12。每个头的 Q, K, V 向量都是64维。
+    float attn_c_attn_out[DSeq][DModel * 3];
+
+    // float attn_q[DSeq][DModel];
+    // float attn_k[DSeq][DModel];
+    // float attn_v[DSeq][DModel];
+
+
+    float attn_softmax_out[DSeq][DSeq];
+    // Attention score: [DSeq, DSeq]
+    float attn_z_out[DSeq][DSeq];
+
+
+
+    // Attention output: [DSeq, DModel]
+    float attn_c_proj_out[DSeq][DModel];
   };
 
-  Embedding embedding;
-  LayerNorm ln_1;
-  LayerNorm ln_2;
+  std::array<TransformerBlock, 12> blocks;
+
+  // Final layer norm
 };
 
 class Decoder {
@@ -137,7 +157,7 @@ int main() {
 
   auto safetensors_json = nlohmann::json::parse(json_str);
 
-  // get tensor data start
+  // Get tensor data start
   auto tensor_data_start = f_weight.tellg();
   f_weight.seekg(0, std::ios::end);
   auto file_end = f_weight.tellg();
@@ -159,74 +179,204 @@ int main() {
   params.wte.weight = get_tensor("wte.weight");
   params.wpe.weight = get_tensor("wpe.weight");
   for (int i = 0; i < 12; i++) {
-    params.headers[i].ln_1.weight = get_tensor(fmt::format("h.{}.ln_1.weight", i));
+    params.headers[i].ln_1.weight =
+        get_tensor(fmt::format("h.{}.ln_1.weight", i));
     params.headers[i].ln_1.bias = get_tensor(fmt::format("h.{}.ln_1.bias", i));
-    params.headers[i].attn.c_attn.weight = get_tensor(fmt::format("h.{}.attn.c_attn.weight", i));
-    params.headers[i].attn.c_attn.bias = get_tensor(fmt::format("h.{}.attn.c_attn.bias", i));
-    params.headers[i].attn.c_proj.weight = get_tensor(fmt::format("h.{}.attn.c_proj.weight", i));
-    params.headers[i].attn.c_proj.bias = get_tensor(fmt::format("h.{}.attn.c_proj.bias", i));
-    params.headers[i].ln_2.weight = get_tensor(fmt::format("h.{}.ln_2.weight", i));
+    params.headers[i].attn.c_attn.weight =
+        get_tensor(fmt::format("h.{}.attn.c_attn.weight", i));
+    params.headers[i].attn.c_attn.bias =
+        get_tensor(fmt::format("h.{}.attn.c_attn.bias", i));
+    params.headers[i].attn.c_proj.weight =
+        get_tensor(fmt::format("h.{}.attn.c_proj.weight", i));
+    params.headers[i].attn.c_proj.bias =
+        get_tensor(fmt::format("h.{}.attn.c_proj.bias", i));
+    params.headers[i].ln_2.weight =
+        get_tensor(fmt::format("h.{}.ln_2.weight", i));
     params.headers[i].ln_2.bias = get_tensor(fmt::format("h.{}.ln_2.bias", i));
-    params.headers[i].mlp.c_fc.weight = get_tensor(fmt::format("h.{}.mlp.c_fc.weight", i));
-    params.headers[i].mlp.c_fc.bias = get_tensor(fmt::format("h.{}.mlp.c_fc.bias", i));
-    params.headers[i].mlp.c_proj.weight = get_tensor(fmt::format("h.{}.mlp.c_proj.weight", i));
-    params.headers[i].mlp.c_proj.bias = get_tensor(fmt::format("h.{}.mlp.c_proj.bias", i));
+    params.headers[i].mlp.c_fc.weight =
+        get_tensor(fmt::format("h.{}.mlp.c_fc.weight", i));
+    params.headers[i].mlp.c_fc.bias =
+        get_tensor(fmt::format("h.{}.mlp.c_fc.bias", i));
+    params.headers[i].mlp.c_proj.weight =
+        get_tensor(fmt::format("h.{}.mlp.c_proj.weight", i));
+    params.headers[i].mlp.c_proj.bias =
+        get_tensor(fmt::format("h.{}.mlp.c_proj.bias", i));
   }
   params.ln_f.weight = get_tensor("ln_f.weight");
   params.ln_f.bias = get_tensor("ln_f.bias");
 
-
-
   auto activation = std::make_unique<Activation>();
   size_t input_size = 64;
+  // Embedding
   for (size_t i = 0; i < input_size; i++) {
     auto token = text_token_ids[i];
     // Token embedding vec
     auto wte = params.wte.weight + token * DModel;
     // Pos embedding vec
     auto wpe = params.wpe.weight + i * DModel;
-    auto embedding_out = activation->embedding.out[i];
+    auto embedding_out = activation->embedding_out[i];
     for (size_t j = 0; j < DModel; j++) {
       embedding_out[j] = wte[j] + wpe[j];
     }
   }
-  float sum = 0.0;
-  for (size_t i = 0; i < input_size; i++) {
-    for (size_t j = 0; j < DModel; j++) {
-      sum += activation->embedding.out[i][j];
-    }
-  }
-  std::cout << sum << std::endl;
 
+  // For test
+  // float sum = 0.0;
+  // for (size_t i = 0; i < input_size; i++) {
+  //   for (size_t j = 0; j < DModel; j++) {
+  //     sum += activation->embedding_out[i][j];
+  //   }
+  // }
+  // std::cout << sum << std::endl;
 
+  // Transformer blocks
   size_t layer_idx = 0;
   for (size_t i = 0; i < input_size; i++) {
+    // LayerNorm 1
     // Calculate the mean
-    const auto sum = std::accumulate(std::begin(activation->embedding.out[i]), std::end(activation->embedding.out[i]), 0.0f);
+    const auto sum =
+        std::accumulate(std::begin(activation->embedding_out[i]),
+                        std::end(activation->embedding_out[i]), 0.0f);
     const auto mean = sum / DModel;
 
     auto total_diff_sq = 0.0;
-    for (auto x : activation->embedding.out[i]) {
+    for (auto x : activation->embedding_out[i]) {
       auto diff = x - mean;
       total_diff_sq += diff * diff;
     }
     auto variance = total_diff_sq / DModel;
-    const float eps = 1e-5f;
-    auto std = std::sqrt(variance + eps);
-
+    auto std = std::sqrt(variance + EPS);
+    // [DModel]
     auto weight = params.headers[layer_idx].ln_1.weight;
     auto bias = params.headers[layer_idx].ln_1.bias;
     for (size_t j = 0; j < DModel; j++) {
-      auto ln_in = (activation->embedding.out[i][j] - mean) / std;
-      activation->ln_1.out[i][j] = ln_in * weight[j] + bias[j];
+      auto ln_in = (activation->embedding_out[i][j] - mean) / std;
+      activation->blocks[layer_idx].ln_1_out[i][j] =
+          ln_in * weight[j] + bias[j];
     }
   }
 
-  sum = 0.0;
+  // For test
+  // sum = 0.0;
+  // for (size_t i = 0; i < input_size; i++) {
+  //   for (size_t j = 0; j < DModel; j++) {
+  //     sum += activation->blocks[layer_idx].ln_1_out[i][j];
+  //   }
+  // }
+  // std::cout << sum << std::endl;
+
+  // Every token in the sequence
   for (size_t i = 0; i < input_size; i++) {
-    for (size_t j = 0; j < DModel; j++) {
-      sum += activation->ln_1.out[i][j];
+    // [DModel, DModel * 3]
+    const auto weight = params.headers[layer_idx].attn.c_attn.weight;
+    // [DModel * 3]
+    const auto bias = params.headers[layer_idx].attn.c_attn.bias;
+    // The i_th token's output vector of layerNorm 1:[DModel]
+    const auto ln_1_out = activation->blocks[layer_idx].ln_1_out[i];
+    // [DModel * 3]
+    auto qkv_out = activation->blocks[layer_idx].attn_c_attn_out[i];
+    const size_t out_dim = DModel * 3;
+    // j: each output position
+    for (size_t j = 0; j < out_dim; j++) {
+      auto acc = bias ? bias[j] : 0.0f;
+      for (size_t k = 0; k < DModel; k++) {
+        acc += ln_1_out[k] * weight[k * out_dim + j];
+      }
+      qkv_out[j] = acc;
     }
+    // Split q, k, v
+    // auto& q_out = activation->blocks[layer_idx].attn_q[i];
+    // auto& k_out = activation->blocks[layer_idx].attn_k[i];
+    // auto& v_out = activation->blocks[layer_idx].attn_v[i];
+    // std::copy(qkv_out, qkv_out + DModel, q_out);
+    // std::copy(qkv_out + DModel, qkv_out + DModel * 2, k_out);
+    // std::copy(qkv_out + DModel * 2, qkv_out + DModel * 3, v_out);
   }
-  std::cout << sum << std::endl;
+
+  // For test
+  // sum = 0.0;
+  // for (size_t i = 0; i < input_size; i++) {
+  //   for (size_t j = 0; j < DModel * 3; j++) {
+  //     sum += activation->blocks[layer_idx].attn_c_attn_out[i][j];
+  //   }
+  // }
+  // std::cout << sum << std::endl;
+
+  for (size_t head_idx = 0; head_idx < 12; head_idx++) {
+    for (size_t q_i = 0; q_i < input_size; q_i++) {
+      // [DK=64]
+      auto q =
+          activation->blocks[layer_idx].attn_c_attn_out[q_i] + head_idx * DK;
+      // auto k = activation->blocks[layer_idx].attn_c_attn_out[q_i] + DModel +
+      // head_idx * DK; auto v =
+      // activation->blocks[layer_idx].attn_c_attn_out[q_i] + DModel * 2 +
+      // head_idx * DK;
+
+      // Calculate the attention score: q * k_is
+      // Before the q_i-th token
+      for (size_t k_i = 0; k_i <= q_i; k_i++) {
+        // [DK=64]
+        auto k = activation->blocks[layer_idx].attn_c_attn_out[k_i] + DModel +
+                 head_idx * DK;
+        float sum = 0.0;
+        for (size_t j = 0; j < DK; j++) {
+          sum += q[j] * k[j];
+        }
+        activation->blocks[layer_idx].attn_z_out[q_i][k_i] = sum;
+      }
+      // After the q_i-th token, the attention score is 0
+      for (size_t k_i = q_i; k_i < input_size; k_i++) {
+        activation->blocks[layer_idx].attn_z_out[q_i][k_i] = 0.0;
+      }
+      // Softmax
+      const auto sum = std::accumulate(
+          activation->blocks[layer_idx].attn_z_out[q_i],
+          activation->blocks[layer_idx].attn_z_out[q_i] + q_i + 1, 0.0);
+
+      for (size_t k_i = 0; k_i <= q_i; k_i++) {
+        auto &x = activation->blocks[layer_idx].attn_softmax_out[q_i][k_i];
+        x = std::exp(x) / sum;
+      }
+
+      for (size_t k_i = q_i; k_i < input_size; k_i++) {
+        activation->blocks[layer_idx].attn_softmax_out[q_i][k_i] = 0.0;
+      }
+
+      // S @ V
+      auto v = activation->blocks[layer_idx].attn_c_attn_out[q_i] + DModel * 2 + head_idx * DK;
+      for (size_t j = 0; j < DK; j++) {
+        float sum = 0.0;
+        auto x = activation->blocks[layer_idx].attn_softmax_out[q_i];
+        for (size_t k_i = 0; k_i < DSeq; k_i++) {
+          sum += x[k_i] * v[k_i * DK + j];
+        }
+        activation->blocks[layer_idx].attn_z_out[q_i][j] = sum;
+      }
+    }
+
+    for (size_t q_i = 0; q_i < input_size; q_i++) {
+      // [DSeq, DModel]
+      const auto weight = params.headers[layer_idx].attn.c_proj.weight;
+      // [DModel]
+      const auto bias = params.headers[layer_idx].attn.c_proj.bias;
+
+      // j: each output position
+      for (size_t j = 0; j < DModel; j++) {
+        auto acc = bias ? bias[j] : 0.0f;
+        // k_i: each input position
+        for (size_t k_i = 0; k_i < DSeq; k_i++) {
+          acc += activation->blocks[layer_idx].attn_z_out[q_i][k_i] *
+                 weight[k_i * DModel + k_i];
+        }
+        activation->blocks[layer_idx].attn_c_proj_out[q_i][j] = acc;
+      }
+    }
+    float sum = 0.0;
+    for (size_t i = 0; i < input_size; i++) {
+      for (size_t j = 0; j < DModel; j++) {
+        sum += activation->blocks[layer_idx].attn_c_proj_out[i][j];
+      }
+    }
+    std::cout << sum << std::endl;
+  }
 }
