@@ -16,6 +16,9 @@ template <typename T> constexpr size_t AlignedSize() {
 }
 
 constexpr auto VocabSize = 50257;
+constexpr auto DModel = 768;
+constexpr auto DSeq = 1024;
+
 // constexpr auto VocabLength = 321428;
 constexpr auto VocabLength = 320827;
 constexpr auto TextTokenLength = 338024;
@@ -56,6 +59,20 @@ struct Parameters {
   LayerParams wpe;
   std::array<TransformerBlock, 12> headers;
   LayerParams ln_f;
+};
+
+struct Activation {
+  struct Embedding {
+    float out[DSeq][DModel];
+  };
+  
+  struct LayerNorm {
+    float out[DSeq][DModel];
+  };
+
+  Embedding embedding;
+  LayerNorm ln_1;
+  LayerNorm ln_2;
 };
 
 class Decoder {
@@ -102,6 +119,7 @@ int main() {
   Decoder decode;
   // decode.Print();
 
+  // The text data
   std::ifstream f_data{"data", std::ios::binary};
   std::vector<uint16_t> text_token_ids(TextTokenLength);
   f_data.read(reinterpret_cast<char *>(text_token_ids.data()),
@@ -132,7 +150,7 @@ int main() {
 
   auto get_tensor = [&](std::string_view key) -> float * {
     if (safetensors_json.contains(key)) {
-      auto start = safetensors_json[key]["data_offsets"][0].get<uint16_t>();
+      auto start = safetensors_json[key]["data_offsets"][0].get<uint64_t>();
       return reinterpret_cast<float *>(tensor_base_ptr + start);
     }
     return nullptr;
@@ -157,8 +175,58 @@ int main() {
   params.ln_f.weight = get_tensor("ln_f.weight");
   params.ln_f.bias = get_tensor("ln_f.bias");
 
-  std::cout << *params.ln_f.weight << std::endl;
-  std::cout << *params.ln_f.bias << std::endl;
-  std::cout << *params.wte.weight << std::endl;
-  std::cout << *params.wpe.weight << std::endl;
+
+
+  auto activation = std::make_unique<Activation>();
+  size_t input_size = 64;
+  for (size_t i = 0; i < input_size; i++) {
+    auto token = text_token_ids[i];
+    // Token embedding vec
+    auto wte = params.wte.weight + token * DModel;
+    // Pos embedding vec
+    auto wpe = params.wpe.weight + i * DModel;
+    auto embedding_out = activation->embedding.out[i];
+    for (size_t j = 0; j < DModel; j++) {
+      embedding_out[j] = wte[j] + wpe[j];
+    }
+  }
+  float sum = 0.0;
+  for (size_t i = 0; i < input_size; i++) {
+    for (size_t j = 0; j < DModel; j++) {
+      sum += activation->embedding.out[i][j];
+    }
+  }
+  std::cout << sum << std::endl;
+
+
+  size_t layer_idx = 0;
+  for (size_t i = 0; i < input_size; i++) {
+    // Calculate the mean
+    const auto sum = std::accumulate(std::begin(activation->embedding.out[i]), std::end(activation->embedding.out[i]), 0.0f);
+    const auto mean = sum / DModel;
+
+    auto total_diff_sq = 0.0;
+    for (auto x : activation->embedding.out[i]) {
+      auto diff = x - mean;
+      total_diff_sq += diff * diff;
+    }
+    auto variance = total_diff_sq / DModel;
+    const float eps = 1e-5f;
+    auto std = std::sqrt(variance + eps);
+
+    auto weight = params.headers[layer_idx].ln_1.weight;
+    auto bias = params.headers[layer_idx].ln_1.bias;
+    for (size_t j = 0; j < DModel; j++) {
+      auto ln_in = (activation->embedding.out[i][j] - mean) / std;
+      activation->ln_1.out[i][j] = ln_in * weight[j] + bias[j];
+    }
+  }
+
+  sum = 0.0;
+  for (size_t i = 0; i < input_size; i++) {
+    for (size_t j = 0; j < DModel; j++) {
+      sum += activation->ln_1.out[i][j];
+    }
+  }
+  std::cout << sum << std::endl;
 }

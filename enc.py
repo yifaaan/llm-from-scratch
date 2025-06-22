@@ -30,3 +30,6 @@ with open("enc", "wb") as f_out:
         f_out.write(v)
     f_out.write(words)
 print(len(words))
+
+
+
