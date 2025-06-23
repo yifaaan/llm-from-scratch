@@ -89,6 +89,11 @@ struct Activation {
     float attn_ctx_out[DSeq][DModel];
     // Attention output: [DSeq, DModel]
     float attn_c_proj_out[DSeq][DModel];
+
+    // Shortcut connection: [DSeq, DModel] = embedding_out + attn_c_proj_out
+
+    // LayerNorm 2
+    float ln_2_out[DSeq][DModel];
   };
 
   std::array<TransformerBlock, 12> blocks;
@@ -134,6 +139,21 @@ private:
   // text
   std::string raw;
 };
+
+// x: [in_f]
+// weight: [in_f, out_f]
+// bias: [out_f]
+// out: [out_f]
+void Linear1XN(const float *x, const float *weight, const float *bias,
+               float *out, size_t in_f, size_t out_f) {
+  for (size_t j = 0; j < out_f; j++) {
+    auto acc = bias ? bias[j] : 0.0f;
+    for (size_t i = 0; i < in_f; i++) {
+      acc += x[i] * weight[i * out_f + j];
+    }
+    out[j] = acc;
+  }
+}
 
 int main() {
 
@@ -277,14 +297,17 @@ int main() {
     // [DModel * 3]
     auto qkv_out = activation->blocks[layer_idx].attn_c_attn_out[i];
     const size_t out_dim = DModel * 3;
+
     // j: each output position
-    for (size_t j = 0; j < out_dim; j++) {
-      auto acc = bias ? bias[j] : 0.0f;
-      for (size_t k = 0; k < DModel; k++) {
-        acc += ln_1_out[k] * weight[k * out_dim + j];
-      }
-      qkv_out[j] = acc;
-    }
+    Linear1XN(ln_1_out, weight, bias, qkv_out, DModel, out_dim);
+    // for (size_t j = 0; j < out_dim; j++) {
+    //   auto acc = bias ? bias[j] : 0.0f;
+    //   for (size_t k = 0; k < DModel; k++) {
+    //     acc += ln_1_out[k] * weight[k * out_dim + j];
+    //   }
+    //   qkv_out[j] = acc;
+    // }
+
     // Split q, k, v
     // auto& q_out = activation->blocks[layer_idx].attn_q[i];
     // auto& k_out = activation->blocks[layer_idx].attn_k[i];
@@ -377,15 +400,53 @@ int main() {
       // [DModel]
       const auto bias = params.headers[layer_idx].attn.c_proj.bias;
 
+      Linear1XN(activation->blocks[layer_idx].attn_ctx_out[q_i], weight, bias,
+                activation->blocks[layer_idx].attn_c_proj_out[q_i], DModel,
+                DModel);
       // j: each output position
+      // for (size_t j = 0; j < DModel; j++) {
+      //   auto acc = bias ? bias[j] : 0.0f;
+      //   // k_i: each input position
+      //   for (size_t k_i = 0; k_i < DModel; k_i++) {
+      //     acc += activation->blocks[layer_idx].attn_ctx_out[q_i][k_i] *
+      //            weight[k_i * DModel + j];
+      //   }
+      //   activation->blocks[layer_idx].attn_c_proj_out[q_i][j] = acc;
+      // }
+    }
+
+    // Shortcut connection: [DSeq, DModel] = embedding_out + attn_c_proj_out
+    // Here we use the attn_c_proj_out as the shortcut connection output
+    for (size_t i = 0; i < input_size; i++) {
       for (size_t j = 0; j < DModel; j++) {
-        auto acc = bias ? bias[j] : 0.0f;
-        // k_i: each input position
-        for (size_t k_i = 0; k_i < DModel; k_i++) {
-          acc += activation->blocks[layer_idx].attn_ctx_out[q_i][k_i] *
-                 weight[k_i * DModel + j];
-        }
-        activation->blocks[layer_idx].attn_c_proj_out[q_i][j] = acc;
+        activation->blocks[layer_idx].attn_c_proj_out[i][j] +=
+            activation->embedding_out[i][j];
+      }
+    }
+
+    for (size_t i = 0; i < input_size; i++) {
+      // LayerNorm 2
+      // Calculate the mean
+      const auto sum = std::accumulate(
+          std::begin(activation->blocks[layer_idx].attn_c_proj_out[i]),
+          std::end(activation->blocks[layer_idx].attn_c_proj_out[i]), 0.0f);
+      const auto mean = sum / DModel;
+
+      auto total_diff_sq = 0.0;
+      for (auto x : activation->blocks[layer_idx].attn_c_proj_out[i]) {
+        auto diff = x - mean;
+        total_diff_sq += diff * diff;
+      }
+      auto variance = total_diff_sq / DModel;
+      auto std = std::sqrt(variance + EPS);
+      // [DModel]
+      auto weight = params.headers[layer_idx].ln_2.weight;
+      auto bias = params.headers[layer_idx].ln_2.bias;
+      for (size_t j = 0; j < DModel; j++) {
+        auto ln_in =
+            (activation->blocks[layer_idx].attn_c_proj_out[i][j] - mean) / std;
+        activation->blocks[layer_idx].ln_2_out[i][j] =
+            ln_in * weight[j] + bias[j];
       }
     }
   }
@@ -402,7 +463,7 @@ int main() {
   float sum = 0.0;
   for (size_t i = 0; i < input_size; i++) {
     for (size_t j = 0; j < DModel; j++) {
-      sum += activation->blocks[layer_idx].attn_c_proj_out[i][j];
+      sum += activation->blocks[layer_idx].ln_2_out[i][j];
     }
   }
   std::cout << sum << std::endl;
