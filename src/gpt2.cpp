@@ -155,6 +155,32 @@ void Linear1XN(const float *x, const float *weight, const float *bias,
   }
 }
 
+void LayerNorm1XN(float *x, float *weight, float *bias, float *out,
+                  size_t in_f) {
+
+  // LayerNorm 2
+  // Calculate the mean
+  float sum = 0.0;
+  for (size_t i = 0; i < in_f; i++) {
+    sum += x[i];
+  }
+  const auto mean = sum / in_f;
+
+  auto total_diff_sq = 0.0;
+  for (size_t i = 0; i < in_f; i++) {
+    auto diff = x[i] - mean;
+    total_diff_sq += diff * diff;
+  }
+  auto variance = total_diff_sq / in_f;
+  auto std = std::sqrt(variance + EPS);
+  // [DModel]
+  for (size_t i = 0; i < in_f; i++) {
+    auto b = bias ? bias[i] : 0.0f;
+    auto ln_in = (x[i] - mean) / std;
+    out[i] = ln_in * weight[i] + b;
+  }
+}
+
 int main() {
 
   Decoder decode;
@@ -255,26 +281,30 @@ int main() {
   for (size_t i = 0; i < input_size; i++) {
     // LayerNorm 1
     // Calculate the mean
-    const auto sum =
-        std::accumulate(std::begin(activation->embedding_out[i]),
-                        std::end(activation->embedding_out[i]), 0.0f);
-    const auto mean = sum / DModel;
+    // const auto sum =
+    //     std::accumulate(std::begin(activation->embedding_out[i]),
+    //                     std::end(activation->embedding_out[i]), 0.0f);
+    // const auto mean = sum / DModel;
 
-    auto total_diff_sq = 0.0;
-    for (auto x : activation->embedding_out[i]) {
-      auto diff = x - mean;
-      total_diff_sq += diff * diff;
-    }
-    auto variance = total_diff_sq / DModel;
-    auto std = std::sqrt(variance + EPS);
-    // [DModel]
-    auto weight = params.headers[layer_idx].ln_1.weight;
-    auto bias = params.headers[layer_idx].ln_1.bias;
-    for (size_t j = 0; j < DModel; j++) {
-      auto ln_in = (activation->embedding_out[i][j] - mean) / std;
-      activation->blocks[layer_idx].ln_1_out[i][j] =
-          ln_in * weight[j] + bias[j];
-    }
+    // auto total_diff_sq = 0.0;
+    // for (auto x : activation->embedding_out[i]) {
+    //   auto diff = x - mean;
+    //   total_diff_sq += diff * diff;
+    // }
+    // auto variance = total_diff_sq / DModel;
+    // auto std = std::sqrt(variance + EPS);
+    // // [DModel]
+    // auto weight = params.headers[layer_idx].ln_1.weight;
+    // auto bias = params.headers[layer_idx].ln_1.bias;
+    // for (size_t j = 0; j < DModel; j++) {
+    //   auto ln_in = (activation->embedding_out[i][j] - mean) / std;
+    //   activation->blocks[layer_idx].ln_1_out[i][j] =
+    //       ln_in * weight[j] + bias[j];
+    // }
+    LayerNorm1XN(activation->embedding_out[i],
+                 params.headers[layer_idx].ln_1.weight,
+                 params.headers[layer_idx].ln_1.bias,
+                 activation->blocks[layer_idx].ln_1_out[i], DModel);
   }
 
   // For test
@@ -427,27 +457,31 @@ int main() {
     for (size_t i = 0; i < input_size; i++) {
       // LayerNorm 2
       // Calculate the mean
-      const auto sum = std::accumulate(
-          std::begin(activation->blocks[layer_idx].attn_c_proj_out[i]),
-          std::end(activation->blocks[layer_idx].attn_c_proj_out[i]), 0.0f);
-      const auto mean = sum / DModel;
+      // const auto sum = std::accumulate(
+      //     std::begin(activation->blocks[layer_idx].attn_c_proj_out[i]),
+      //     std::end(activation->blocks[layer_idx].attn_c_proj_out[i]), 0.0f);
+      // const auto mean = sum / DModel;
 
-      auto total_diff_sq = 0.0;
-      for (auto x : activation->blocks[layer_idx].attn_c_proj_out[i]) {
-        auto diff = x - mean;
-        total_diff_sq += diff * diff;
-      }
-      auto variance = total_diff_sq / DModel;
-      auto std = std::sqrt(variance + EPS);
-      // [DModel]
-      auto weight = params.headers[layer_idx].ln_2.weight;
-      auto bias = params.headers[layer_idx].ln_2.bias;
-      for (size_t j = 0; j < DModel; j++) {
-        auto ln_in =
-            (activation->blocks[layer_idx].attn_c_proj_out[i][j] - mean) / std;
-        activation->blocks[layer_idx].ln_2_out[i][j] =
-            ln_in * weight[j] + bias[j];
-      }
+      // auto total_diff_sq = 0.0;
+      // for (auto x : activation->blocks[layer_idx].attn_c_proj_out[i]) {
+      //   auto diff = x - mean;
+      //   total_diff_sq += diff * diff;
+      // }
+      // auto variance = total_diff_sq / DModel;
+      // auto std = std::sqrt(variance + EPS);
+      // // [DModel]
+      // auto weight = params.headers[layer_idx].ln_2.weight;
+      // auto bias = params.headers[layer_idx].ln_2.bias;
+      // for (size_t j = 0; j < DModel; j++) {
+      //   auto ln_in =
+      //       (activation->blocks[layer_idx].attn_c_proj_out[i][j] - mean) / std;
+      //   activation->blocks[layer_idx].ln_2_out[i][j] =
+      //       ln_in * weight[j] + bias[j];
+      // }
+      LayerNorm1XN(activation->blocks[layer_idx].attn_c_proj_out[i],
+                   params.headers[layer_idx].ln_2.weight,
+                   params.headers[layer_idx].ln_2.bias,
+                   activation->blocks[layer_idx].ln_2_out[i], DModel);
     }
   }
   // For test
