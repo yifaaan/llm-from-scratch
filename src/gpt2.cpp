@@ -79,13 +79,14 @@ struct Activation {
     // float attn_k[DSeq][DModel];
     // float attn_v[DSeq][DModel];
 
+    // logits: Q @ K: [DSeq, DSeq]
+    float attn_logits_out[12][DSeq][DSeq];
 
-    float attn_softmax_out[DSeq][DSeq];
+    float attn_softmax_out[12][DSeq][DSeq];
     // Attention score: [DSeq, DSeq]
     float attn_z_out[DSeq][DSeq];
 
-
-
+    float attn_ctx_out[DSeq][DModel];
     // Attention output: [DSeq, DModel]
     float attn_c_proj_out[DSeq][DModel];
   };
@@ -304,7 +305,7 @@ int main() {
 
   for (size_t head_idx = 0; head_idx < 12; head_idx++) {
     for (size_t q_i = 0; q_i < input_size; q_i++) {
-      // [DK=64]
+      // q_i-th token's q_token_vec:[DK=64]
       auto q =
           activation->blocks[layer_idx].attn_c_attn_out[q_i] + head_idx * DK;
       // auto k = activation->blocks[layer_idx].attn_c_attn_out[q_i] + DModel +
@@ -313,49 +314,65 @@ int main() {
       // head_idx * DK;
 
       // Calculate the attention score: q * k_is
-      // Before the q_i-th token
+      // All the tokens before the q_i-th token
       for (size_t k_i = 0; k_i <= q_i; k_i++) {
-        // [DK=64]
+        // k_i-th token's k_vec:[DK=64]
         auto k = activation->blocks[layer_idx].attn_c_attn_out[k_i] + DModel +
                  head_idx * DK;
         float sum = 0.0;
         for (size_t j = 0; j < DK; j++) {
           sum += q[j] * k[j];
         }
-        activation->blocks[layer_idx].attn_z_out[q_i][k_i] = sum;
+        activation->blocks[layer_idx].attn_logits_out[head_idx][q_i][k_i] =
+            sum / std::sqrt(static_cast<float>(DK));
       }
-      // After the q_i-th token, the attention score is 0
-      for (size_t k_i = q_i; k_i < input_size; k_i++) {
-        activation->blocks[layer_idx].attn_z_out[q_i][k_i] = 0.0;
-      }
+
       // Softmax
+      const auto max_logit = *std::max_element(
+          activation->blocks[layer_idx].attn_logits_out[head_idx][q_i],
+          activation->blocks[layer_idx].attn_logits_out[head_idx][q_i] + q_i +
+              1);
       const auto sum = std::accumulate(
-          activation->blocks[layer_idx].attn_z_out[q_i],
-          activation->blocks[layer_idx].attn_z_out[q_i] + q_i + 1, 0.0);
+          activation->blocks[layer_idx].attn_logits_out[head_idx][q_i],
+          activation->blocks[layer_idx].attn_logits_out[head_idx][q_i] + q_i +
+              1,
+          0.0, [=](float acc, float logit) {
+            return acc + std::exp(logit - max_logit);
+          });
 
       for (size_t k_i = 0; k_i <= q_i; k_i++) {
-        auto &x = activation->blocks[layer_idx].attn_softmax_out[q_i][k_i];
-        x = std::exp(x) / sum;
+        auto &x =
+            activation->blocks[layer_idx].attn_softmax_out[head_idx][q_i][k_i];
+        auto logit =
+            activation->blocks[layer_idx].attn_logits_out[head_idx][q_i][k_i];
+        x = std::exp(logit - max_logit) / sum;
       }
 
-      for (size_t k_i = q_i; k_i < input_size; k_i++) {
-        activation->blocks[layer_idx].attn_softmax_out[q_i][k_i] = 0.0;
+      for (size_t k_i = q_i + 1; k_i < input_size; k_i++) {
+        activation->blocks[layer_idx].attn_softmax_out[head_idx][q_i][k_i] =
+            0.0;
       }
 
-      // S @ V
-      auto v = activation->blocks[layer_idx].attn_c_attn_out[q_i] + DModel * 2 + head_idx * DK;
+      // S @ V: z_token_vec = s_token_vec @ all_v_tokens_vec
+      auto s_token =
+          activation->blocks[layer_idx].attn_softmax_out[head_idx][q_i];
       for (size_t j = 0; j < DK; j++) {
         float sum = 0.0;
-        auto x = activation->blocks[layer_idx].attn_softmax_out[q_i];
-        for (size_t k_i = 0; k_i < DSeq; k_i++) {
-          sum += x[k_i] * v[k_i * DK + j];
+        // attn_softmax_out[head_idx][q_i][q_i, q_i+1, ..., input_size] is zero
+        for (size_t k_i = 0; k_i <= q_i; k_i++) {
+          // k_i-th token's v_token_vec
+          auto v_token = activation->blocks[layer_idx].attn_c_attn_out[k_i] +
+                         DModel * 2 + head_idx * DK;
+          sum += s_token[k_i] * v_token[j];
         }
-        activation->blocks[layer_idx].attn_z_out[q_i][j] = sum;
+        activation->blocks[layer_idx].attn_ctx_out[q_i][head_idx * DK + j] =
+            sum;
       }
     }
 
+    // Calculate the attn_c_proj_out
     for (size_t q_i = 0; q_i < input_size; q_i++) {
-      // [DSeq, DModel]
+      // [DModel, DModel]
       const auto weight = params.headers[layer_idx].attn.c_proj.weight;
       // [DModel]
       const auto bias = params.headers[layer_idx].attn.c_proj.bias;
@@ -364,19 +381,29 @@ int main() {
       for (size_t j = 0; j < DModel; j++) {
         auto acc = bias ? bias[j] : 0.0f;
         // k_i: each input position
-        for (size_t k_i = 0; k_i < DSeq; k_i++) {
-          acc += activation->blocks[layer_idx].attn_z_out[q_i][k_i] *
-                 weight[k_i * DModel + k_i];
+        for (size_t k_i = 0; k_i < DModel; k_i++) {
+          acc += activation->blocks[layer_idx].attn_ctx_out[q_i][k_i] *
+                 weight[k_i * DModel + j];
         }
         activation->blocks[layer_idx].attn_c_proj_out[q_i][j] = acc;
       }
     }
-    float sum = 0.0;
-    for (size_t i = 0; i < input_size; i++) {
-      for (size_t j = 0; j < DModel; j++) {
-        sum += activation->blocks[layer_idx].attn_c_proj_out[i][j];
-      }
-    }
-    std::cout << sum << std::endl;
   }
+  // For test
+  // float sum = 0.0;
+  // for (size_t i = 0; i < input_size; i++) {
+  //   for (size_t j = 0; j < DModel; j++) {
+  //     sum += activation->blocks[layer_idx].attn_ctx_out[i][j];
+  //   }
+  // }
+  // std::cout << sum << std::endl;
+
+  // For test
+  float sum = 0.0;
+  for (size_t i = 0; i < input_size; i++) {
+    for (size_t j = 0; j < DModel; j++) {
+      sum += activation->blocks[layer_idx].attn_c_proj_out[i][j];
+    }
+  }
+  std::cout << sum << std::endl;
 }
