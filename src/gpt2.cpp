@@ -116,30 +116,30 @@ struct Activation {
 class Decoder {
 public:
     Decoder() {
-        tokens.resize(VOCAB_SIZE);
-        raw.resize(VOCAB_LENGTH);
+        tokens_.resize(VOCAB_SIZE);
+        raw_.resize(VOCAB_LENGTH);
         std::ifstream enc{"enc", std::ios::binary};
-        enc.read(reinterpret_cast<char*>(tokens.data()), VOCAB_SIZE * sizeof(Token));
-        enc.read(raw.data(), VOCAB_LENGTH);
+        enc.read(reinterpret_cast<char*>(tokens_.data()), VOCAB_SIZE * sizeof(Token));
+        enc.read(raw_.data(), VOCAB_LENGTH);
     }
 
-    void Print() {
-        for (const auto& token : tokens) {
+    void print() {
+        for (const auto& token : tokens_) {
             std::cout << fmt::format(
                 "offset:{}, size:{}, token:{}\n",
                 token.offset,
                 token.size,
-                std::string_view{raw.data() + token.offset, token.size});
+                std::string_view{raw_.data() + token.offset, token.size});
         }
     }
 
-    std::string TokensToString(std::span<uint16_t> ids) {
+    std::string tokens_to_string(std::span<const uint16_t> ids) {
         std::string result;
         for (auto id : ids) {
             // std::cout << fmt::format(
             //     "{}->{}\n", id,
             //     std::string_view{raw.data() + tokens[id].offset, tokens[id].size});
-            result += std::string_view{raw.data() + tokens[id].offset, tokens[id].size};
+            result += std::string_view{raw_.data() + tokens_[id].offset, tokens_[id].size};
         }
         // std::cout << result << '\n';
         return result;
@@ -147,24 +147,12 @@ public:
 
 private:
     // vocab table
-    std::vector<Token> tokens;
+    std::vector<Token> tokens_;
     // text
-    std::string raw;
+    std::string raw_;
 };
 
-// x: [in_f]
-// weight: [in_f, out_f]
-// bias: [out_f]
-// out: [out_f]
-void linear_1xn(const float* x, const float* weight, const float* bias, float* out, size_t in_f, size_t out_f) {
-    for (size_t j = 0; j < out_f; j++) {
-        auto acc = bias ? bias[j] : 0.0f;
-        for (size_t i = 0; i < in_f; i++) {
-            acc += x[i] * weight[i * out_f + j];
-        }
-        out[j] = acc;
-    }
-}
+
 
 // in: [input_size, in_f]
 // weight: [in_f, out_f]
@@ -184,30 +172,10 @@ void full_connect(float* in, float* weight, float* bias, float* out, size_t in_f
     }
 }
 
-void layer_norm_1xn(float* x, float* weight, float* bias, float* out, size_t in_f) {
-    // LayerNorm 2
-    // Calculate the mean
-    float sum = 0.0f;
-    for (size_t i = 0; i < in_f; i++) {
-        sum += x[i];
-    }
-    const auto mean = sum / in_f;
-
-    auto total_diff_sq = 0.0f;
-    for (size_t i = 0; i < in_f; i++) {
-        auto diff = x[i] - mean;
-        total_diff_sq += diff * diff;
-    }
-    auto variance = total_diff_sq / in_f;
-    auto std = std::sqrt(variance + EPS);
-    // [DModel]
-    for (size_t i = 0; i < in_f; i++) {
-        auto b = bias ? bias[i] : 0.0f;
-        auto ln_in = (x[i] - mean) / std;
-        out[i] = ln_in * weight[i] + b;
-    }
-}
-
+// in: [input_size, in_f]
+// weight: [in_f]
+// bias: [in_f]
+// out: [input_size, in_f]
 void layer_norm(
     const float* in, const float* weight, const float* bias, float* out, const size_t in_f, const size_t input_size) {
     for (size_t i = 0; i < input_size; i++) {
@@ -246,7 +214,7 @@ int main() {
     std::ifstream f_data{"data", std::ios::binary};
     std::vector<uint16_t> text_token_ids(TEXT_TOKEN_LENGTH);
     f_data.read(reinterpret_cast<char*>(text_token_ids.data()), TEXT_TOKEN_LENGTH * 2);
-    decode.TokensToString(text_token_ids);
+    decode.tokens_to_string(text_token_ids);
 
     std::ifstream f_weight{"model.safetensors", std::ios::binary};
     uint64_t json_size;
@@ -488,9 +456,14 @@ int main() {
 
     // Predict the next token
     const auto row = activation->y_pred[input_size - 1];
-    const auto target_idx = std::distance(row, std::max_element(row, row + VOCAB_SIZE));
-    std::cout << fmt::format("target token id:{}", target_idx);
-
+    const uint16_t target_idx = std::distance(row, std::max_element(row, row + VOCAB_SIZE));
+    std::cout << fmt::format("target token id:{}\n", target_idx);
+    for (size_t i = 0; i < input_size; i++) {
+        uint16_t token_id = text_token_ids[i];
+        fmt::print("{}", decode.tokens_to_string(std::vector{token_id}));
+    }
+    fmt::print("\n");
+    fmt::print("{}\n", decode.tokens_to_string(std::vector{target_idx}));
     // {
     //     float sum = 0.0f;
     //     for (size_t k = 0; k < input_size; k++) {
