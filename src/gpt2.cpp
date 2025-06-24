@@ -121,6 +121,10 @@ struct ActivationBack {
     float unembedding_out[D_SEQ][VOCAB_SIZE];
 };
 
+struct Gradients {
+    float wte_weight[VOCAB_SIZE][D_MODEL];
+};
+
 class Decoder {
 public:
     Decoder() {
@@ -200,13 +204,13 @@ void layer_norm(
             total_diff_sq += diff * diff;
         }
         auto variance = total_diff_sq / in_f;
-        auto std = std::sqrt(variance + EPS);
+        auto r_std = 1.0f / std::sqrt(variance + EPS);
         // [DModel]
 
         auto o = out + i * in_f;
         for (size_t j = 0; j < in_f; j++) {
             auto b = bias ? bias[j] : 0.0f;
-            auto ln_in = (x[j] - mean) / std;
+            auto ln_in = (x[j] - mean) * r_std;
             o[j] = ln_in * weight[j] + b;
         }
     }
@@ -331,19 +335,20 @@ int main() {
                 }
 
                 // Softmax
-                const auto max_logit = *std::max_element(
+                const double max_logit = *std::max_element(
                     activation->blocks[layer_i].attn_logits_out[head_idx][q_i],
                     activation->blocks[layer_i].attn_logits_out[head_idx][q_i] + q_i + 1);
-                const auto sum = std::accumulate(
+                const double sum = std::accumulate(
                     activation->blocks[layer_i].attn_logits_out[head_idx][q_i],
                     activation->blocks[layer_i].attn_logits_out[head_idx][q_i] + q_i + 1,
-                    0.0f,
+                    0.0,
                     [=](float acc, float logit) { return acc + std::exp(logit - max_logit); });
 
+                const double r_sum = 1.0 / sum;
                 for (size_t k_i = 0; k_i <= q_i; k_i++) {
                     auto& x = activation->blocks[layer_i].attn_softmax_out[head_idx][q_i][k_i];
                     auto logit = activation->blocks[layer_i].attn_logits_out[head_idx][q_i][k_i];
-                    x = std::exp(logit - max_logit) / sum;
+                    x = static_cast<float>(std::exp(logit - max_logit) * r_sum);
                 }
 
                 for (size_t k_i = q_i + 1; k_i < input_size; k_i++) {
@@ -479,10 +484,10 @@ int main() {
         auto out = activation->p[i];
 
         auto max_logit = *std::max_element(in, in + VOCAB_SIZE);
-        auto sum = std::accumulate(
-            in, in + VOCAB_SIZE, 0.0f, [=](float acc, float logit) { return acc + std::exp(logit - max_logit); });
+        auto r_sum = 1.0f / std::accumulate(
+            in, in + VOCAB_SIZE, 0.0, [=](float acc, float logit) { return acc + std::exp(logit - max_logit); });
         for (size_t j = 0; j < VOCAB_SIZE; j++) {
-            out[j] = std::exp(in[j] - max_logit) / sum;
+            out[j] = static_cast<float>(std::exp(in[j] - max_logit) * r_sum);
         }
     }
 
@@ -499,8 +504,9 @@ int main() {
 
     // Backward
 
-    // d(loss)/d(softmax(x))
+    // d(loss) / d(softmax(x))
     auto activation_back = std::make_unique<ActivationBack>();
+    auto gradients = std::make_unique<Gradients>();
     std::memcpy(activation_back->unembedding_out, activation->p, sizeof(activation->p));
     for (size_t i = 0; i < input_size; i++) {
         auto true_id = expected_token_ids[i];
@@ -520,18 +526,46 @@ int main() {
         std::cout << fmt::format("grad[unembedding_out] sum:{}\n", sum);
     }
 
+
+    // d(loss) / d(ln_f_out)
+    // d(loss) / d(wte.weight) = d(loss) / d(unembedding_out)  * d(unembedding_out) / d(wte.weight)
+
+    std::memset(activation_back->ln_f_out, 0, sizeof(activation_back->ln_f_out));
+    std::memset(gradients->wte_weight, 0, sizeof(gradients->wte_weight));
     for (size_t i = 0; i < input_size; i++) {
         const auto weight = params.wte.weight;
+        // ln_f_out: [D_SEQ, D_MODEL]
+        // wte.weight: [VOCAB_SIZE, D_MODEL]
+        // unembedding_out: [D_SEQ, VOCAB_SIZE]
         // unembedding_out = ln_f_out @ wte.weight.T
         const auto dl_dout = activation_back->unembedding_out[i];
         // dl_din = dl_out @ wte.weight
         auto dl_din = activation_back->ln_f_out[i];
+        
         for (size_t j = 0; j < D_MODEL; j++) {
             float acc = 0.0f;
             for (size_t k = 0; k < VOCAB_SIZE; k++) {
                 acc += dl_dout[k] * weight[k * D_MODEL + j];
             }
-            dl_din[j] = acc;
+            dl_din[j] += acc;
+        }
+
+        // dl_dweight = dl_out.T @ activation->ln_f_out
+        // activation->ln_f_out: [x0, x1, x2, ..., xD_MODEL]
+        // dl_dout:[g0, g1, g2, ..., gVOCAB_SIZE]
+
+        // [x0 * g0, x1 * g0, x2 * g0, ..., xD_MODEL * g0]
+        // [x0 * g1, x1 * g1, x2 * g1, ..., xD_MODEL * g1]
+        // [x0 * g2, x1 * g2, x2 * g2, ..., xD_MODEL * g2]
+        // ...
+        // [x0 * gVOCAB_SIZE, x1 * gVOCAB_SIZE, x2 * gVOCAB_SIZE, ..., xD_MODEL * gVOCAB_SIZE]
+        auto dl_dweight = gradients->wte_weight; // [VOCAB_SIZE, D_MODEL]
+        const auto x_row = activation->ln_f_out[i]; // [D_MODEL]
+        const auto dl_dout_row = activation_back->unembedding_out[i]; // [VOCAB_SIZE]
+        for (size_t j = 0; j < VOCAB_SIZE; j++) {
+            for (size_t k = 0; k < D_MODEL; k++) {
+                dl_dweight[j][k] += dl_dout_row[j] * x_row[k];
+            }
         }
     }
 
@@ -543,6 +577,14 @@ int main() {
             }
         }
         std::cout << fmt::format("grad[ln_f_out] sum:{}\n", sum);
+
+        sum = 0.0f;
+        for (size_t k = 0; k < VOCAB_SIZE; k++) {
+            for (size_t j = 0; j < D_MODEL; j++) {
+                sum += gradients->wte_weight[k][j];
+            }
+        }
+        std::cout << fmt::format("grad[wte.weight] sum:{}\n", sum);
     }
 
     // // For test
