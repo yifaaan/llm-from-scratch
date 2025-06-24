@@ -109,8 +109,16 @@ struct Activation {
     std::array<TransformerBlock, 12> blocks;
 
     float ln_f_out[D_SEQ][D_MODEL];
-    float y_pred[D_SEQ][VOCAB_LENGTH];
+    float unembedding_out[D_SEQ][VOCAB_SIZE];
+    // Softmax output
+    float p[D_SEQ][VOCAB_SIZE];
     // Final layer norm
+};
+
+struct ActivationBack {
+    float ln_f_out[D_SEQ][D_MODEL];
+
+    float unembedding_out[D_SEQ][VOCAB_SIZE];
 };
 
 class Decoder {
@@ -151,8 +159,6 @@ private:
     // text
     std::string raw_;
 };
-
-
 
 // in: [input_size, in_f]
 // weight: [in_f, out_f]
@@ -442,7 +448,7 @@ int main() {
 
     for (size_t i = 0; i < input_size; i++) {
         auto in = activation->ln_f_out[i];
-        auto out = activation->y_pred[i];
+        auto out = activation->unembedding_out[i];
         // ln_f_out[i] * W.T
         for (size_t j = 0; j < VOCAB_SIZE; j++) {
             float dot = 0.0f;
@@ -454,25 +460,90 @@ int main() {
         }
     }
 
-    // Predict the next token
-    const auto row = activation->y_pred[input_size - 1];
-    const uint16_t target_idx = std::distance(row, std::max_element(row, row + VOCAB_SIZE));
-    std::cout << fmt::format("target token id:{}\n", target_idx);
-    for (size_t i = 0; i < input_size; i++) {
-        uint16_t token_id = text_token_ids[i];
-        fmt::print("{}", decode.tokens_to_string(std::vector{token_id}));
+    {
+        // Predict the next token
+        // const auto row = activation->unembedding_out[input_size - 1];
+        // const uint16_t target_idx = std::distance(row, std::max_element(row, row + VOCAB_SIZE));
+        // std::cout << fmt::format("target token id:{}\n", target_idx);
+        // for (size_t i = 0; i < input_size; i++) {
+        //     uint16_t token_id = text_token_ids[i];
+        //     fmt::print("{}", decode.tokens_to_string(std::vector{token_id}));
+        // }
+        // fmt::print("\n");
+        // fmt::print("{}\n", decode.tokens_to_string(std::vector{target_idx}));
     }
-    fmt::print("\n");
-    fmt::print("{}\n", decode.tokens_to_string(std::vector{target_idx}));
-    // {
-    //     float sum = 0.0f;
-    //     for (size_t k = 0; k < input_size; k++) {
-    //         for (size_t j = 0; j < VOCAB_SIZE; j++) {
-    //             sum += activation->y_pred[k][j];
-    //         }
-    //     }
-    //     std::cout << fmt::format("sum:{}\n", sum);
-    // }
+
+    // Softmax
+    for (size_t i = 0; i < input_size; i++) {
+        auto in = activation->unembedding_out[i];
+        auto out = activation->p[i];
+
+        auto max_logit = *std::max_element(in, in + VOCAB_SIZE);
+        auto sum = std::accumulate(
+            in, in + VOCAB_SIZE, 0.0f, [=](float acc, float logit) { return acc + std::exp(logit - max_logit); });
+        for (size_t j = 0; j < VOCAB_SIZE; j++) {
+            out[j] = std::exp(in[j] - max_logit) / sum;
+        }
+    }
+
+    // Cross entropy loss
+    float loss = 0.0f;
+    auto expected_token_ids = std::span{text_token_ids.begin() + 1, text_token_ids.end()};
+    for (size_t i = 0; i < input_size; i++) {
+        auto true_id = expected_token_ids[i];
+        auto ce = -std::logf(activation->p[i][true_id]);
+        loss += ce;
+    }
+    loss /= input_size;
+    fmt::print("loss:{}\n", loss);
+
+    // Backward
+
+    // d(loss)/d(softmax(x))
+    auto activation_back = std::make_unique<ActivationBack>();
+    std::memcpy(activation_back->unembedding_out, activation->p, sizeof(activation->p));
+    for (size_t i = 0; i < input_size; i++) {
+        auto true_id = expected_token_ids[i];
+        activation_back->unembedding_out[i][true_id] -= 1.0f;
+        for (size_t j = 0; j < VOCAB_SIZE; j++) {
+            activation_back->unembedding_out[i][j] /= input_size;
+        }
+    }
+
+    {
+        float sum = 0.0f;
+        for (size_t k = 0; k < input_size; k++) {
+            for (size_t j = 0; j < VOCAB_SIZE; j++) {
+                sum += activation_back->unembedding_out[k][j];
+            }
+        }
+        std::cout << fmt::format("grad[unembedding_out] sum:{}\n", sum);
+    }
+
+    for (size_t i = 0; i < input_size; i++) {
+        const auto weight = params.wte.weight;
+        // unembedding_out = ln_f_out @ wte.weight.T
+        const auto dl_dout = activation_back->unembedding_out[i];
+        // dl_din = dl_out @ wte.weight
+        auto dl_din = activation_back->ln_f_out[i];
+        for (size_t j = 0; j < D_MODEL; j++) {
+            float acc = 0.0f;
+            for (size_t k = 0; k < VOCAB_SIZE; k++) {
+                acc += dl_dout[k] * weight[k * D_MODEL + j];
+            }
+            dl_din[j] = acc;
+        }
+    }
+
+    {
+        float sum = 0.0f;
+        for (size_t k = 0; k < input_size; k++) {
+            for (size_t j = 0; j < D_MODEL; j++) {
+                sum += activation_back->ln_f_out[k][j];
+            }
+        }
+        std::cout << fmt::format("grad[ln_f_out] sum:{}\n", sum);
+    }
 
     // // For test
     // for (size_t i = 0; i < 12; i++) {
