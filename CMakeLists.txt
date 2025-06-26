@@ -23,6 +23,10 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+
+
+
+
 # 设置目标名称(ProjectName-SystemName)
 set(TARGET ${PROJECT_NAME}-${CMAKE_SYSTEM_NAME})
 
