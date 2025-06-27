@@ -123,6 +123,23 @@ struct Activation {
 
 struct ActivationBack {
     struct TransformerBlock {
+        // Self-Attention: Q, K, V
+        //  每个头的维度 | d_k = 64 (隐式) | head_dim = 64 (需要定义) | 64 | DModel
+        //  num_heads，即 768 / 12。每个头的 Q, K, V 向量都是64维。
+        float attn_c_attn_out[D_SEQ][D_MODEL * 3];
+
+        // float attn_q[DSeq][DModel];
+        // float attn_k[DSeq][DModel];
+        // float attn_v[DSeq][DModel];
+
+        // logits: Q @ K: [DSeq, DSeq]
+        float attn_logits_out[12][D_SEQ][D_SEQ];
+
+        float attn_softmax_out[12][D_SEQ][D_SEQ];
+        // Attention score: [DSeq, DSeq]
+        float attn_z_out[D_SEQ][D_MODEL];
+
+        float res_1_out[D_SEQ][D_MODEL];
         float ln_2_out[D_SEQ][D_MODEL];
         float mlp_c_fc_out[D_SEQ][D_MODEL * 4];
         float mlp_gelu_out[D_SEQ][D_MODEL * 4];
@@ -137,6 +154,14 @@ struct ActivationBack {
 
 struct Gradients {
     struct TransformerBlock {
+        float ln_1_weight[D_MODEL];
+        float ln_1_bias[D_MODEL];
+
+        float attn_c_attn_weight[D_MODEL][D_MODEL * 3];
+        float attn_c_attn_bias[D_MODEL * 3];
+        float attn_c_proj_weight[D_MODEL][D_MODEL];
+        float attn_c_proj_bias[D_MODEL];
+
         float ln_2_weight[D_MODEL];
         float ln_2_bias[D_MODEL];
         float mlp_c_fc_weight[D_MODEL][D_MODEL * 4];
@@ -872,5 +897,74 @@ int main() {
             }
         }
         fmt::println("gradients->blocks[11].mlp_c_fc_weight sum: {}", sum);
+    }
+
+    {
+        std::memset(gradients->blocks[11].ln_2_weight, 0, sizeof(gradients->blocks[11].ln_2_weight));
+        std::memset(gradients->blocks[11].ln_2_bias, 0, sizeof(gradients->blocks[11].ln_2_bias));
+        layer_norm_backward(
+            reinterpret_cast<float*>(activation->blocks[11].res_1_out),
+            params.headers[11].ln_2.weight,
+            reinterpret_cast<float*>(activation_back->blocks[11].ln_2_out),
+            reinterpret_cast<float*>(activation->blocks[11].ln_2_mean),
+            reinterpret_cast<float*>(activation->blocks[11].ln_2_r_std),
+            reinterpret_cast<float*>(activation_back->blocks[11].res_1_out),
+            reinterpret_cast<float*>(gradients->blocks[11].ln_2_weight),
+            reinterpret_cast<float*>(gradients->blocks[11].ln_2_bias),
+            D_MODEL,
+            input_size);
+    }
+    {
+        double sum = 0.0;
+        for (size_t j = 0; j < D_MODEL; ++j) {
+            sum += std::abs(gradients->blocks[11].ln_2_bias[j]);
+        }
+        fmt::println("gradients->blocks[11].ln_2_bias sum: {}", sum);
+
+        sum = 0.0;
+        for (size_t k = 0; k < D_MODEL; ++k) {
+            sum += std::abs(gradients->blocks[11].ln_2_weight[k]);
+        }
+        fmt::println("gradients->blocks[11].ln_2_weight sum: {}", sum);
+    }
+
+    {
+        std::memset(gradients->blocks[11].attn_c_proj_weight, 0, sizeof(gradients->blocks[11].attn_c_proj_weight));
+        std::memset(gradients->blocks[11].attn_c_proj_bias, 0, sizeof(gradients->blocks[11].attn_c_proj_bias));
+        full_connect_backward(
+            reinterpret_cast<float*>(activation->blocks[11].attn_z_out),
+            params.headers[11].attn.c_proj.weight,
+            reinterpret_cast<float*>(activation_back->blocks[11].res_1_out),
+            reinterpret_cast<float*>(activation_back->blocks[11].attn_z_out),
+            reinterpret_cast<float*>(gradients->blocks[11].attn_c_proj_weight),
+            reinterpret_cast<float*>(gradients->blocks[11].attn_c_proj_bias),
+            D_MODEL,
+            D_MODEL,
+            input_size);
+    }
+    {
+        double sum = 0.0;
+        for (size_t j = 0; j < D_MODEL; ++j) {
+            sum += std::abs(gradients->blocks[11].attn_c_proj_bias[j]);
+        }
+        fmt::println("gradients->blocks[11].attn_c_proj_bias sum: {}", sum);
+
+        sum = 0.0;
+        for (size_t j = 0; j < D_MODEL; ++j) {
+            for (size_t k = 0; k < D_MODEL; ++k) {
+                sum += std::abs(gradients->blocks[11].attn_c_proj_weight[j][k]);
+            }
+        }
+        fmt::println("gradients->blocks[11].attn_c_proj_weight sum: {}", sum);
+
+        sum = 0.0;
+        for (size_t j = 0; j < D_SEQ; ++j) {
+            for (size_t k = 0; k < D_SEQ; ++k) {
+                sum += std::abs(activation_back->blocks[11].attn_z_out[j][k]);
+            }
+        }
+        fmt::println("activation_back->blocks[11].attn_z_out sum: {}", sum);
+
+        sum = 0.0;
     }
 }
