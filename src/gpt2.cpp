@@ -122,7 +122,12 @@ struct Activation {
 };
 
 struct ActivationBack {
+    float embedding_out[D_SEQ][D_MODEL];
     struct TransformerBlock {
+        float ln_1_weight[D_MODEL];
+        float ln_1_bias[D_MODEL];
+        float ln_1_out[D_SEQ][D_MODEL];
+
         // Self-Attention: Q, K, V
         //  每个头的维度 | d_k = 64 (隐式) | head_dim = 64 (需要定义) | 64 | DModel
         //  num_heads，即 768 / 12。每个头的 Q, K, V 向量都是64维。
@@ -139,11 +144,13 @@ struct ActivationBack {
         // Attention score: [DSeq, DSeq]
         float attn_z_out[D_SEQ][D_MODEL];
 
+        float res_1_in_2[D_SEQ][D_MODEL];
         float res_1_out[D_SEQ][D_MODEL];
         float ln_2_out[D_SEQ][D_MODEL];
         float mlp_c_fc_out[D_SEQ][D_MODEL * 4];
         float mlp_gelu_out[D_SEQ][D_MODEL * 4];
         float mlp_c_project_out[D_SEQ][D_MODEL];
+        float res_2_in_2[D_SEQ][D_MODEL];
         float res_2_out[D_SEQ][D_MODEL];
     };
     std::array<TransformerBlock, 12> blocks;
@@ -153,6 +160,7 @@ struct ActivationBack {
 };
 
 struct Gradients {
+    float wpe_weight[D_SEQ][D_MODEL];
     struct TransformerBlock {
         float ln_1_weight[D_MODEL];
         float ln_1_bias[D_MODEL];
@@ -660,6 +668,7 @@ int main() {
     // d(loss) / d(softmax(x))
     auto activation_back = std::make_unique<ActivationBack>();
     auto gradients = std::make_unique<Gradients>();
+    std::memset(gradients->wpe_weight, 0, sizeof(gradients->wpe_weight));
     std::memcpy(activation_back->unembedding_out, activation->p, sizeof(activation->p));
     for (size_t i = 0; i < input_size; i++) {
         auto true_id = expected_token_ids[i];
@@ -753,218 +762,214 @@ int main() {
         D_MODEL,
         input_size);
 
-    {
-        double sum = 0.0;
-        for (size_t i = 0; i < D_MODEL; i++) {
-            sum += (double)gradients->ln_f_weight[i];
+    for (int layer_i = 11; layer_i >= 0; --layer_i) {
+        {
+            std::memset(
+                gradients->blocks[layer_i].mlp_c_project_weight,
+                0,
+                sizeof(gradients->blocks[layer_i].mlp_c_project_weight));
+            std::memset(
+                gradients->blocks[layer_i].mlp_c_project_bias,
+                0,
+                sizeof(gradients->blocks[layer_i].mlp_c_project_bias));
+            full_connect_backward(
+                reinterpret_cast<float*>(activation->blocks[layer_i].mlp_gelu_out),         // X  [batch, 3072]
+                params.headers[layer_i].mlp.c_proj.weight,                                  // W  [3072, 768]
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].res_2_out),       // G  [batch, 768]
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].mlp_gelu_out),    // dX
+                reinterpret_cast<float*>(gradients->blocks[layer_i].mlp_c_project_weight),  // dW
+                reinterpret_cast<float*>(gradients->blocks[layer_i].mlp_c_project_bias),    // db
+                D_MODEL * 4,                                                                // in_f  = 3072
+                D_MODEL,                                                                    // out_f = 768
+                input_size);
         }
-        std::cout << fmt::format("grad[ln_f_weight] sum:{}\n", sum);
-    }
-    {
-        double sum = 0.0;
-        for (size_t i = 0; i < input_size; i++) {
-            for (size_t j = 0; j < D_MODEL; j++) {
-                sum += (double)activation_back->blocks[11].res_2_out[i][j];
+        {
+            constexpr float kA = 0.7978845608028654f;  // √(2/π)
+            constexpr float kCubic = 0.044715f;
+            constexpr float kA3Cubic = kA * 3.0f * kCubic;  // a·0.134145
+
+            const size_t in_f = D_MODEL * 4;         // 3072
+            const size_t elems = input_size * in_f;  // 64 × 3072
+
+            auto x_ptr = reinterpret_cast<float*>(activation->blocks[layer_i].mlp_c_fc_out);       // x
+            auto g_out = reinterpret_cast<float*>(activation_back->blocks[layer_i].mlp_gelu_out);  // ∂L/∂y
+            auto g_in = reinterpret_cast<float*>(activation_back->blocks[layer_i].mlp_c_fc_out);   // ∂L/∂x (目标)
+
+            for (size_t idx = 0; idx < elems; ++idx) {
+                float x = x_ptr[idx];
+
+                // u = a*(x+0.044715x³)
+                float u = kA * (x + kCubic * x * x * x);
+                float t = std::tanh(u);      // tanh(u)
+                float sech2 = 1.0f - t * t;  // sech²(u)
+
+                // dy/dx
+                float dy_dx = 0.5f * (1.0f + t) + 0.5f * x * sech2 * (kA + kA3Cubic * x * x);
+
+                g_in[idx] = g_out[idx] * dy_dx;
             }
         }
-        std::cout << fmt::format("grad[res_2_out] sum:{}\n", sum);
-    }
 
-    {
-        std::memset(gradients->blocks[11].mlp_c_project_weight, 0, sizeof(gradients->blocks[11].mlp_c_project_weight));
-        std::memset(gradients->blocks[11].mlp_c_project_bias, 0, sizeof(gradients->blocks[11].mlp_c_project_bias));
+        {
+            std::memset(
+                gradients->blocks[layer_i].mlp_c_fc_weight, 0, sizeof(gradients->blocks[layer_i].mlp_c_fc_weight));
+            std::memset(gradients->blocks[layer_i].mlp_c_fc_bias, 0, sizeof(gradients->blocks[layer_i].mlp_c_fc_bias));
+            // in_f = 768 , out_f = 3072
+            full_connect_backward(
+                reinterpret_cast<float*>(activation->blocks[layer_i].ln_2_out),
+                params.headers[layer_i].mlp.c_fc.weight,
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].mlp_c_fc_out),
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].ln_2_out),
+                reinterpret_cast<float*>(gradients->blocks[layer_i].mlp_c_fc_weight),
+                reinterpret_cast<float*>(gradients->blocks[layer_i].mlp_c_fc_bias),
+                D_MODEL,
+                D_MODEL * 4,
+                input_size);
+        }
+
+        {
+            std::memset(gradients->blocks[layer_i].ln_2_weight, 0, sizeof(gradients->blocks[layer_i].ln_2_weight));
+            std::memset(gradients->blocks[layer_i].ln_2_bias, 0, sizeof(gradients->blocks[layer_i].ln_2_bias));
+            layer_norm_backward(
+                reinterpret_cast<float*>(activation->blocks[layer_i].res_1_out),
+                params.headers[layer_i].ln_2.weight,
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].ln_2_out),
+                reinterpret_cast<float*>(activation->blocks[layer_i].ln_2_mean),
+                reinterpret_cast<float*>(activation->blocks[layer_i].ln_2_r_std),
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].res_1_out),
+                reinterpret_cast<float*>(gradients->blocks[layer_i].ln_2_weight),
+                reinterpret_cast<float*>(gradients->blocks[layer_i].ln_2_bias),
+                D_MODEL,
+                input_size);
+            {
+                // Add back the gradient from the res_2_out shortcut connection
+                auto g_res_1_out = reinterpret_cast<float*>(activation_back->blocks[layer_i].res_1_out);
+                auto g_res_2_out = reinterpret_cast<float*>(activation_back->blocks[layer_i].res_2_out);
+                for (size_t j = 0; j < input_size * D_MODEL; ++j) {
+                    g_res_1_out[j] += g_res_2_out[j];
+                }
+            }
+        }
+        {
+            std::memset(
+                gradients->blocks[layer_i].attn_c_proj_weight,
+                0,
+                sizeof(gradients->blocks[layer_i].attn_c_proj_weight));
+            std::memset(
+                gradients->blocks[layer_i].attn_c_proj_bias, 0, sizeof(gradients->blocks[layer_i].attn_c_proj_bias));
+            full_connect_backward(
+                reinterpret_cast<float*>(activation->blocks[layer_i].attn_z_out),
+                params.headers[layer_i].attn.c_proj.weight,
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].res_1_out),
+                reinterpret_cast<float*>(activation_back->blocks[layer_i].attn_z_out),
+                reinterpret_cast<float*>(gradients->blocks[layer_i].attn_c_proj_weight),
+                reinterpret_cast<float*>(gradients->blocks[layer_i].attn_c_proj_bias),
+                D_MODEL,
+                D_MODEL,
+                input_size);
+        }
+        std::memset(
+            activation_back->blocks[layer_i].attn_c_attn_out,
+            0,
+            sizeof(activation_back->blocks[layer_i].attn_c_attn_out));
+        std::memset(
+            activation_back->blocks[layer_i].attn_logits_out,
+            0,
+            sizeof(activation_back->blocks[layer_i].attn_logits_out));
+        std::memset(
+            activation_back->blocks[layer_i].attn_softmax_out,
+            0,
+            sizeof(activation_back->blocks[layer_i].attn_softmax_out));
+
+        for (int head_i = 0; head_i < 12; ++head_i) {
+            for (int i = input_size - 1; i >= 0; --i) {
+                float* g_z_row = activation_back->blocks[layer_i].attn_z_out[i] + head_i * DK;
+                float* s_row = activation->blocks[layer_i].attn_softmax_out[head_i][i];
+
+                float* g_s_row = activation_back->blocks[layer_i].attn_softmax_out[head_i][i];
+
+                for (int k_i = 0; k_i <= i; ++k_i) {
+                    float* v_row_k = activation->blocks[layer_i].attn_c_attn_out[k_i] + 2 * D_MODEL + head_i * DK;
+                    for (int j = 0; j < DK; ++j) {
+                        g_s_row[k_i] += g_z_row[j] * v_row_k[j];
+                    }
+                }
+
+                float* g_logits_row = activation_back->blocks[layer_i].attn_logits_out[head_i][i];
+                float dot_product = 0;
+                for (int k_i = 0; k_i <= i; ++k_i) {
+                    dot_product += g_s_row[k_i] * s_row[k_i];
+                }
+                for (int k_i = 0; k_i <= i; ++k_i) {
+                    g_logits_row[k_i] = s_row[k_i] * (g_s_row[k_i] - dot_product);
+                }
+
+                float rsqrt_dk = 1.0f / std::sqrt(static_cast<float>(DK));
+                for (int k_i = 0; k_i <= i; ++k_i) {
+                    float* q_row_i = activation->blocks[layer_i].attn_c_attn_out[i] + head_i * DK;
+                    float* g_q_row_i = activation_back->blocks[layer_i].attn_c_attn_out[i] + head_i * DK;
+                    float* k_row_k = activation->blocks[layer_i].attn_c_attn_out[k_i] + D_MODEL + head_i * DK;
+                    float* g_k_row_k = activation_back->blocks[layer_i].attn_c_attn_out[k_i] + D_MODEL + head_i * DK;
+                    float* g_v_row_k =
+                        activation_back->blocks[layer_i].attn_c_attn_out[k_i] + 2 * D_MODEL + head_i * DK;
+
+                    for (int j = 0; j < DK; ++j) {
+                        g_q_row_i[j] += g_logits_row[k_i] * k_row_k[j] * rsqrt_dk;
+                        g_k_row_k[j] += g_logits_row[k_i] * q_row_i[j] * rsqrt_dk;
+                        g_v_row_k[j] += g_z_row[j] * s_row[k_i];
+                    }
+                }
+            }
+        }
         full_connect_backward(
-            reinterpret_cast<float*>(activation->blocks[11].mlp_gelu_out),         // X  [batch, 3072]
-            params.headers[11].mlp.c_proj.weight,                                  // W  [3072, 768]
-            reinterpret_cast<float*>(activation_back->blocks[11].res_2_out),       // G  [batch, 768]
-            reinterpret_cast<float*>(activation_back->blocks[11].mlp_gelu_out),    // dX
-            reinterpret_cast<float*>(gradients->blocks[11].mlp_c_project_weight),  // dW
-            reinterpret_cast<float*>(gradients->blocks[11].mlp_c_project_bias),    // db
-            D_MODEL * 4,                                                           // in_f  = 3072
-            D_MODEL,                                                               // out_f = 768
-            input_size);
-        // for (size_t i = 0; i < input_size; i++) {
-        //     const auto weight = params.headers[11].mlp.c_proj.weight;
-        //     const auto& g_out_row = activation_back->blocks[11].res_2_out;
-        //     auto dl_dx = activation_back->blocks[11].mlp_gelu_out[i];
-        //     auto dl_dbias = gradients->blocks[11].mlp_c_project_bias;
-        //     for (size_t j = 0; j < D_MODEL * 4; j++) {
-        //         float acc = 0.0f;
-        //         for (size_t k = 0; k < D_MODEL; k++) {
-        //             acc += g_out_row[i][k] * weight[j * D_MODEL + k];
-        //         }
-        //         dl_dx[j] = acc;
-        //     }
-        //     for (size_t j = 0; j < D_MODEL; j++) {
-        //         dl_dbias[j] += g_out_row[i][j];
-        //     }
-        // }
-        // for (size_t i = 0; i < input_size; i++) {
-        //     const auto& g_out_row = activation_back->blocks[11].res_2_out[i];
-        //     const auto& x_row = activation->blocks[11].mlp_gelu_out[i];
-        //     auto dl_dweight = gradients->blocks[11].mlp_c_project_weight;
-        //     for (size_t k = 0; k < D_MODEL * 4; k++) {
-        //         for (size_t j = 0; j < D_MODEL; j++) {
-        //             dl_dweight[k][j] += x_row[k] * g_out_row[j];
-        //         }
-        //     }
-        // }
-    }
-    {
-        constexpr float kA = 0.7978845608028654f;  // √(2/π)
-        constexpr float kCubic = 0.044715f;
-        constexpr float kA3Cubic = kA * 3.0f * kCubic;  // a·0.134145
-
-        const size_t in_f = D_MODEL * 4;         // 3072
-        const size_t elems = input_size * in_f;  // 64 × 3072
-
-        auto x_ptr = reinterpret_cast<float*>(activation->blocks[11].mlp_c_fc_out);       // x
-        auto g_out = reinterpret_cast<float*>(activation_back->blocks[11].mlp_gelu_out);  // ∂L/∂y
-        auto g_in = reinterpret_cast<float*>(activation_back->blocks[11].mlp_c_fc_out);   // ∂L/∂x (目标)
-
-        for (size_t idx = 0; idx < elems; ++idx) {
-            float x = x_ptr[idx];
-
-            // u = a*(x+0.044715x³)
-            float u = kA * (x + kCubic * x * x * x);
-            float t = std::tanh(u);      // tanh(u)
-            float sech2 = 1.0f - t * t;  // sech²(u)
-
-            // dy/dx
-            float dy_dx = 0.5f * (1.0f + t) + 0.5f * x * sech2 * (kA + kA3Cubic * x * x);
-
-            g_in[idx] = g_out[idx] * dy_dx;
-        }
-    }
-
-    // For test
-    {
-        double sum = 0.0;
-        for (size_t j = 0; j < D_MODEL; j++) {
-            sum += std::abs(gradients->blocks[11].mlp_c_project_bias[j]);
-        }
-        fmt::println("gradients->blocks[11].mlp_c_project_bias sum:{}", sum);
-        sum = 0.0;
-        for (size_t k = 0; k < D_MODEL * 4; k++) {
-            for (size_t j = 0; j < D_MODEL; j++) {
-                sum += std::abs(gradients->blocks[11].mlp_c_project_weight[k][j]);
-            }
-        }
-        fmt::println("gradients->blocks[11].mlp_c_project_weight sum: {}", sum);
-        sum = 0.0;
-        for (size_t k = 0; k < D_SEQ; k++) {
-            for (size_t j = 0; j < D_MODEL * 4; j++) {
-                sum += std::abs(activation_back->blocks[11].mlp_gelu_out[k][j]);
-            }
-        }
-        fmt::println("activation_back->blocks[11].mlp_gelu_out sum: {}", sum);
-        sum = 0.0;
-        for (size_t k = 0; k < D_SEQ; k++) {
-            for (size_t j = 0; j < D_MODEL * 4; j++) {
-                sum += std::abs(activation_back->blocks[11].mlp_c_fc_out[k][j]);
-            }
-        }
-        fmt::println("activation_back->blocks[11].mlp_c_fc_out sum: {}", sum);
-    }
-
-    {
-        std::memset(gradients->blocks[11].mlp_c_fc_weight, 0, sizeof(gradients->blocks[11].mlp_c_fc_weight));
-        std::memset(gradients->blocks[11].mlp_c_fc_bias, 0, sizeof(gradients->blocks[11].mlp_c_fc_bias));
-        // in_f = 768 , out_f = 3072
-        full_connect_backward(
-            reinterpret_cast<float*>(activation->blocks[11].ln_2_out),
-            params.headers[11].mlp.c_fc.weight,
-            reinterpret_cast<float*>(activation_back->blocks[11].mlp_c_fc_out),
-            reinterpret_cast<float*>(activation_back->blocks[11].ln_2_out),
-            reinterpret_cast<float*>(gradients->blocks[11].mlp_c_fc_weight),
-            reinterpret_cast<float*>(gradients->blocks[11].mlp_c_fc_bias),
+            reinterpret_cast<float*>(activation->blocks[layer_i].ln_1_out),
+            params.headers[layer_i].attn.c_attn.weight,
+            reinterpret_cast<float*>(activation_back->blocks[layer_i].attn_c_attn_out),
+            reinterpret_cast<float*>(activation_back->blocks[layer_i].ln_1_out),
+            reinterpret_cast<float*>(gradients->blocks[layer_i].attn_c_attn_weight),
+            reinterpret_cast<float*>(gradients->blocks[layer_i].attn_c_attn_bias),
             D_MODEL,
-            D_MODEL * 4,
+            D_MODEL * 3,
             input_size);
-    }
-
-    {
-        double sum = 0.0;
-        for (size_t j = 0; j < D_MODEL * 4; ++j) {  // bias 长度 3072
-            sum += std::abs(gradients->blocks[11].mlp_c_fc_bias[j]);
-        }
-        fmt::println("gradients->blocks[11].mlp_c_fc_bias   sum: {}", sum);
-
-        sum = 0.0;
-        for (size_t k = 0; k < D_MODEL; ++k) {
-            for (size_t j = 0; j < D_MODEL * 4; ++j) {
-                sum += std::abs(gradients->blocks[11].mlp_c_fc_weight[k][j]);
-            }
-        }
-        fmt::println("gradients->blocks[11].mlp_c_fc_weight sum: {}", sum);
-    }
-
-    {
-        std::memset(gradients->blocks[11].ln_2_weight, 0, sizeof(gradients->blocks[11].ln_2_weight));
-        std::memset(gradients->blocks[11].ln_2_bias, 0, sizeof(gradients->blocks[11].ln_2_bias));
         layer_norm_backward(
-            reinterpret_cast<float*>(activation->blocks[11].res_1_out),
-            params.headers[11].ln_2.weight,
-            reinterpret_cast<float*>(activation_back->blocks[11].ln_2_out),
-            reinterpret_cast<float*>(activation->blocks[11].ln_2_mean),
-            reinterpret_cast<float*>(activation->blocks[11].ln_2_r_std),
-            reinterpret_cast<float*>(activation_back->blocks[11].res_1_out),
-            reinterpret_cast<float*>(gradients->blocks[11].ln_2_weight),
-            reinterpret_cast<float*>(gradients->blocks[11].ln_2_bias),
+            layer_i == 0 ? reinterpret_cast<float*>(activation->embedding_out)
+                         : reinterpret_cast<float*>(activation->blocks[layer_i - 1].res_2_out),
+            params.headers[layer_i].ln_1.weight,
+            reinterpret_cast<float*>(activation_back->blocks[layer_i].ln_1_out),
+            reinterpret_cast<float*>(activation->blocks[layer_i].ln_1_mean),
+            reinterpret_cast<float*>(activation->blocks[layer_i].ln_1_r_std),
+            reinterpret_cast<float*>(activation_back->blocks[layer_i].res_1_in_2),
+            reinterpret_cast<float*>(gradients->blocks[layer_i].ln_1_weight),
+            reinterpret_cast<float*>(gradients->blocks[layer_i].ln_1_bias),
             D_MODEL,
             input_size);
-    }
-    {
-        double sum = 0.0;
-        for (size_t j = 0; j < D_MODEL; ++j) {
-            sum += std::abs(gradients->blocks[11].ln_2_bias[j]);
-        }
-        fmt::println("gradients->blocks[11].ln_2_bias sum: {}", sum);
-
-        sum = 0.0;
-        for (size_t k = 0; k < D_MODEL; ++k) {
-            sum += std::abs(gradients->blocks[11].ln_2_weight[k]);
-        }
-        fmt::println("gradients->blocks[11].ln_2_weight sum: {}", sum);
-    }
-
-    {
-        std::memset(gradients->blocks[11].attn_c_proj_weight, 0, sizeof(gradients->blocks[11].attn_c_proj_weight));
-        std::memset(gradients->blocks[11].attn_c_proj_bias, 0, sizeof(gradients->blocks[11].attn_c_proj_bias));
-        full_connect_backward(
-            reinterpret_cast<float*>(activation->blocks[11].attn_z_out),
-            params.headers[11].attn.c_proj.weight,
-            reinterpret_cast<float*>(activation_back->blocks[11].res_1_out),
-            reinterpret_cast<float*>(activation_back->blocks[11].attn_z_out),
-            reinterpret_cast<float*>(gradients->blocks[11].attn_c_proj_weight),
-            reinterpret_cast<float*>(gradients->blocks[11].attn_c_proj_bias),
-            D_MODEL,
-            D_MODEL,
-            input_size);
-    }
-    {
-        double sum = 0.0;
-        for (size_t j = 0; j < D_MODEL; ++j) {
-            sum += std::abs(gradients->blocks[11].attn_c_proj_bias[j]);
-        }
-        fmt::println("gradients->blocks[11].attn_c_proj_bias sum: {}", sum);
-
-        sum = 0.0;
-        for (size_t j = 0; j < D_MODEL; ++j) {
-            for (size_t k = 0; k < D_MODEL; ++k) {
-                sum += std::abs(gradients->blocks[11].attn_c_proj_weight[j][k]);
+        {
+            const float* in_1 = reinterpret_cast<float*>(activation_back->blocks[layer_i].res_1_out);
+            const float* in_2 = reinterpret_cast<float*>(activation_back->blocks[layer_i].res_1_in_2);
+            float* out = layer_i == 0 ? reinterpret_cast<float*>(activation_back->embedding_out)
+                                      : reinterpret_cast<float*>(activation_back->blocks[layer_i - 1].res_2_out);
+            float* out_end = out + input_size * D_MODEL;
+            for (; out != out_end; out++, in_1++, in_2++) {
+                *out = *in_1 + *in_2;
             }
         }
-        fmt::println("gradients->blocks[11].attn_c_proj_weight sum: {}", sum);
-
-        sum = 0.0;
-        for (size_t j = 0; j < D_SEQ; ++j) {
-            for (size_t k = 0; k < D_SEQ; ++k) {
-                sum += std::abs(activation_back->blocks[11].attn_z_out[j][k]);
-            }
-        }
-        fmt::println("activation_back->blocks[11].attn_z_out sum: {}", sum);
-
-        sum = 0.0;
     }
+    for (size_t i = 0; i < input_size; i++) {
+        const float* dl_dout = reinterpret_cast<float*>(activation_back->embedding_out[i]);
+        const float* dl_dout_end = dl_dout + D_MODEL;
+        float* dl_dwte = reinterpret_cast<float*>(gradients->wte_weight) + text_token_ids[i] * i;
+        float* dl_dwpe = reinterpret_cast<float*>(gradients->wpe_weight) + D_MODEL * i;
+        for (; dl_dout != dl_dout_end; dl_dout++, dl_dwte++, dl_dwpe++) {
+            *dl_dwte += *dl_dout;
+            *dl_dwpe += *dl_dout;
+        }
+    }
+
+    double sum = 0.0;
+    for (size_t i = 0; i < VOCAB_SIZE; i++) {
+        for (size_t j = 0; j < D_MODEL; j++) {
+            sum += std::abs(gradients->wte_weight[i][j]);
+        }
+    }
+    fmt::println("grad[wte.weight] sum: {}", sum);
 }
